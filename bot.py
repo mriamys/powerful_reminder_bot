@@ -5,7 +5,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -45,7 +45,8 @@ def task_action_kb(task_id, is_done):
     status_text = "✅ Отметить как выполненное" if not is_done else "❌ Вернуть в невыполненные"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=status_text, callback_data=f"toggle_{task_id}_{int(not is_done)}")],
-        [InlineKeyboardButton(text="🗑 Удалить задачу", callback_data=f"delete_{task_id}")]
+        [InlineKeyboardButton(text="🗑 Удалить задачу", callback_data=f"delete_{task_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="back_tasks_list")]
     ])
 
 @router.message(CommandStart())
@@ -74,7 +75,7 @@ async def cmd_help(message: Message):
         "3️⃣ **Напоминания**\n"
         "Можешь указать точное время в формате ЧЧ:ММ (например, 09:30 или 20:00), и бот пришлет сообщение!\n\n"
         "4️⃣ **Списки и Выполнение**\n"
-        "Нажми «📝 Мои задачи». Там можно нажать на задачу и отметить её как выполненную ✅."
+        "Нажми «📝 Мои задачи». Там можно нажать на задачу, отметить её как выполненную ✅ или удалить 🗑."
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -95,7 +96,26 @@ async def cmd_tasks_list(message: Message):
         btn_text = f"{status} {daily_icon} {title}{time_str}"
         kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_{t_id}")])
 
-    await message.answer(f"Твой личный список задач (нажми на задачу):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer("Твой личный список задач (нажми на задачу):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data == "back_tasks_list")
+async def cq_back_tasks_list(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    tasks = await db.get_user_tasks(user_id)
+    
+    if not tasks:
+        await callback.message.edit_text("У тебя пока нет задач. Нажми «➕ Добавить задачу» на клавиатуре!")
+        return
+
+    kb = []
+    for t_id, title, is_daily, rem_time, is_done in tasks:
+        status = "✅" if is_done else "⏳"
+        daily_icon = "🔁" if is_daily else "📝"
+        time_str = f" (в {rem_time})" if rem_time else ""
+        btn_text = f"{status} {daily_icon} {title}{time_str}"
+        kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_{t_id}")])
+
+    await callback.message.edit_text("Твой личный список задач (нажми на задачу):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data.startswith("view_"))
 async def cq_view_task(callback: CallbackQuery):
@@ -129,7 +149,48 @@ async def cq_toggle_task(callback: CallbackQuery):
         await db.mark_task_undone(task_id)
         await callback.answer("Задача снова в процессе ⏳")
         
-    await cq_view_task(callback)
+    # Refresh in the list context with delete button available
+    tasks = await db.get_user_tasks(callback.from_user.id)
+    task = next((t for t in tasks if t[0] == task_id), None)
+    if task:
+        t_id, title, is_daily, rem_time, is_done = task
+        text = f"📌 **Задача:** {title}\n"
+        text += f"Тип: {'Ежедневная 🔁' if is_daily else 'На один раз 📝'}\n"
+        if rem_time:
+            text += f"Время напоминания: {rem_time}\n"
+        text += f"Статус: **{'Выполнена ✅' if is_done else 'В процессе ⏳'}**"
+        await callback.message.edit_text(text, reply_markup=task_action_kb(t_id, is_done), parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("remtoggle_"))
+async def cq_remtoggle_task(callback: CallbackQuery):
+    _, task_id, new_status = callback.data.split("_")
+    task_id = int(task_id)
+    new_status = bool(int(new_status))
+    
+    tasks = await db.get_user_tasks(callback.from_user.id)
+    task = next((t for t in tasks if t[0] == task_id), None)
+    
+    if new_status:
+        await db.mark_task_done(task_id)
+        await callback.answer("Молодец! Задача выполнена ✅")
+    else:
+        await db.mark_task_undone(task_id)
+        await callback.answer("Задача снова в процессе ⏳")
+        
+    title = task[1] if task else "задача"
+    status_label = "Выполнена ✅" if new_status else "В процессе ⏳"
+    next_btn = (
+        InlineKeyboardButton(text="❌ Вернуть в невыполненные", callback_data=f"remtoggle_{task_id}_0")
+        if new_status else
+        InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"remtoggle_{task_id}_1")
+    )
+    
+    # In reminder messages: ONLY toggle button, NO delete button!
+    await callback.message.edit_text(
+        f"🔔 **НАПОМИНАНИЕ!**\nПора сделать: {title}\n\nСтатус: **{status_label}**",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[next_btn]]),
+        parse_mode="Markdown"
+    )
 
 @router.callback_query(F.data.startswith("delete_"))
 async def cq_delete_task(callback: CallbackQuery):
@@ -137,13 +198,16 @@ async def cq_delete_task(callback: CallbackQuery):
     await db.delete_task(task_id)
     await callback.answer("Задача удалена 🗑")
     await callback.message.delete()
+    
     # Refresh list
     tasks = await db.get_user_tasks(callback.from_user.id)
     if tasks:
         kb = []
         for t_id, title, is_daily, rem_time, is_done in tasks:
             status = "✅" if is_done else "⏳"
-            btn_text = f"{status} {title}"
+            daily_icon = "🔁" if is_daily else "📝"
+            time_str = f" (в {rem_time})" if rem_time else ""
+            btn_text = f"{status} {daily_icon} {title}{time_str}"
             kb.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_{t_id}")])
         await callback.message.answer("Оставшиеся задачи:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     else:
@@ -196,10 +260,7 @@ async def process_time_skip(callback: CallbackQuery, state: FSMContext):
 
 async def finalize_task(message: Message, state: FSMContext, time_str: str | None):
     data = await state.get_data()
-    user_id = message.chat.id
     
-    # Optional context (for CallbackQuery message might be slightly different context)
-    # user_id should be from the person doing it
     if hasattr(message, "chat"):
         uid = message.chat.id
     else:
@@ -222,7 +283,7 @@ async def check_reminders():
                     f"🔔 **НАПОМИНАНИЕ!**\nПора сделать: {title}", 
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"toggle_{t_id}_1")]
+                        [InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"remtoggle_{t_id}_1")]
                     ])
                 )
             except Exception as e:
