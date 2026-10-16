@@ -45,14 +45,14 @@ async def ensure_daily_reset(today_str: str):
         )
         await db.commit()
 
-async def add_task(user_id: int, title: str, is_daily: bool, reminder_time: str = None):
+async def add_task(user_id: int, title: str, is_daily: bool, reminder_time: str = None, last_reminded_date: str = None):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             """
             INSERT INTO tasks (user_id, title, is_daily, reminder_time, is_done, last_completed_date, last_reminded_date) 
-            VALUES (?, ?, ?, ?, 0, NULL, NULL)
+            VALUES (?, ?, ?, ?, 0, NULL, ?)
             """,
-            (user_id, title, is_daily, reminder_time)
+            (user_id, title, is_daily, reminder_time, last_reminded_date)
         )
         await db.commit()
 

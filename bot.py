@@ -386,8 +386,22 @@ async def finalize_task(message: Message, state: FSMContext, time_str: str | Non
     uid = message.chat.id if hasattr(message, "chat") else message.from_user.id
     title = data['title']
     is_daily = data['is_daily']
+    
+    # Если задача создается на время, которое сегодня уже прошло,
+    # ставим last_reminded_date = today, чтобы она начала напоминать с завтрашнего дня
+    initial_reminded_date = None
+    if time_str and is_daily:
+        try:
+            r_hour, r_min = map(int, time_str.strip().split(":"))
+            r_minutes = r_hour * 60 + r_min
+            now = get_now()
+            now_minutes = now.hour * 60 + now.minute
+            if r_minutes < now_minutes:
+                initial_reminded_date = get_today_str()
+        except Exception:
+            pass
         
-    await db.add_task(uid, title, is_daily, time_str)
+    await db.add_task(uid, title, is_daily, time_str, initial_reminded_date)
     await state.clear()
     
     type_badge = "🔁 Ежедневная" if is_daily else "📝 Разовая"
@@ -420,7 +434,7 @@ async def check_reminders():
         if is_done and last_completed_date == today_str:
             continue
             
-        # If already reminded today, do not spam
+        # If already successfully reminded today, skip
         if last_reminded_date == today_str:
             continue
             
@@ -430,10 +444,11 @@ async def check_reminders():
         except Exception:
             continue
             
-        # Grace window: send if exact minute OR within 5 minutes past scheduled time
-        # (guarantees delivery even if server/bot rebooted or lagged during the exact minute)
-        diff = now_minutes - r_minutes
-        if 0 <= diff <= 5:
+        # Время наступило (now_minutes >= r_minutes).
+        # Бот будет упорно пытаться отправить напоминание каждую минуту,
+        # пока отправка не завершится успехом (даже если прошло больше 5 минут).
+        # Отправка фиксируется в базе СТРОГО ПОСЛЕ успешной доставки сообщения!
+        if now_minutes >= r_minutes:
             title_escaped = html.escape(title)
             text = (
                 f"📌 <b>{title_escaped}</b>\n\n"
@@ -448,10 +463,13 @@ async def check_reminders():
                         [InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"remtoggle_{t_id}_1")]
                     ])
                 )
+                # Фиксируем отправку ТОЛЬКО ПОСЛЕ успешной отправки сообщения
                 await db.mark_task_reminded(t_id, today_str)
-                logging.info(f"Reminder sent for task {t_id} ('{title}') to {user_id}")
+                logging.info(f"Reminder successfully sent and recorded for task {t_id} ('{title}') to {user_id}")
             except Exception as e:
-                logging.error(f"Failed to send reminder to {user_id}: {e}")
+                # Если отправка сорвалась (сбой сети, перезапуск, ошибка Telegram),
+                # отправка НЕ фиксируется, бот повторит попытку на следующей минуте
+                logging.error(f"Failed to send reminder for task {t_id} to {user_id} (will retry): {e}")
 
 async def reset_daily():
     today_str = get_today_str()
