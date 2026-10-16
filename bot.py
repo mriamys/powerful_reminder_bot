@@ -2,6 +2,7 @@ import asyncio
 import os
 import html
 import logging
+import zoneinfo
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -23,11 +24,29 @@ import db
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in .env")
 
 logging.basicConfig(level=logging.INFO)
+
+try:
+    BOT_TZ = zoneinfo.ZoneInfo(TIMEZONE_NAME)
+except Exception:
+    logging.warning(f"Unknown timezone '{TIMEZONE_NAME}', falling back to Europe/Kyiv or UTC")
+    try:
+        BOT_TZ = zoneinfo.ZoneInfo("Europe/Kyiv")
+        TIMEZONE_NAME = "Europe/Kyiv"
+    except Exception:
+        BOT_TZ = zoneinfo.ZoneInfo("UTC")
+        TIMEZONE_NAME = "UTC"
+
+def get_now() -> datetime:
+    return datetime.now(BOT_TZ)
+
+def get_today_str() -> str:
+    return get_now().strftime("%Y-%m-%d")
 
 bot = Bot(
     token=BOT_TOKEN, 
@@ -105,6 +124,7 @@ async def cmd_help(message: Message):
 @router.message(F.text == "📝 Мои задачи")
 async def cmd_tasks_list(message: Message):
     user_id = message.from_user.id
+    await db.ensure_daily_reset(get_today_str())
     tasks = await db.get_user_tasks(user_id)
     
     if not tasks:
@@ -131,6 +151,7 @@ async def cmd_tasks_list(message: Message):
 @router.callback_query(F.data == "back_tasks_list")
 async def cq_back_tasks_list(callback: CallbackQuery):
     user_id = callback.from_user.id
+    await db.ensure_daily_reset(get_today_str())
     tasks = await db.get_user_tasks(user_id)
     
     if not tasks:
@@ -156,6 +177,7 @@ async def cq_back_tasks_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("view_"))
 async def cq_view_task(callback: CallbackQuery):
+    await db.ensure_daily_reset(get_today_str())
     task_id = int(callback.data.split("_")[1])
     tasks = await db.get_user_tasks(callback.from_user.id)
     task = next((t for t in tasks if t[0] == task_id), None)
@@ -173,6 +195,7 @@ async def cq_toggle_task(callback: CallbackQuery):
     _, task_id, new_status = callback.data.split("_")
     task_id = int(task_id)
     new_status = bool(int(new_status))
+    today_str = get_today_str()
     
     tasks = await db.get_user_tasks(callback.from_user.id)
     task = next((t for t in tasks if t[0] == task_id), None)
@@ -211,7 +234,7 @@ async def cq_toggle_task(callback: CallbackQuery):
                 )
             return
         else:
-            await db.mark_task_done(task_id)
+            await db.mark_task_done(task_id, today_str)
             await callback.answer("Ежедневная задача выполнена! ✅")
     else:
         await db.mark_task_undone(task_id)
@@ -229,6 +252,7 @@ async def cq_remtoggle_task(callback: CallbackQuery):
     _, task_id, new_status = callback.data.split("_")
     task_id = int(task_id)
     new_status = bool(int(new_status))
+    today_str = get_today_str()
     
     tasks = await db.get_user_tasks(callback.from_user.id)
     task = next((t for t in tasks if t[0] == task_id), None)
@@ -252,7 +276,7 @@ async def cq_remtoggle_task(callback: CallbackQuery):
             )
             return
         else:
-            await db.mark_task_done(task_id)
+            await db.mark_task_done(task_id, today_str)
             await callback.answer("Отлично! Задача выполнена ✅")
             next_btn = InlineKeyboardButton(text="↩️ Вернуть в невыполненные", callback_data=f"remtoggle_{task_id}_0")
             await callback.message.edit_text(
@@ -380,12 +404,37 @@ async def finalize_task(message: Message, state: FSMContext, time_str: str | Non
 
 # --- Scheduler Jobs ---
 async def check_reminders():
-    now_str = datetime.now().strftime("%H:%M")
+    now = get_now()
+    today_str = get_today_str()
+    now_minutes = now.hour * 60 + now.minute
+    
+    # Self-heal check: ensure today's reset has happened
+    await db.ensure_daily_reset(today_str)
     tasks = await db.get_all_tasks()
-    for t_id, user_id, title, is_daily, rem_time, is_done in tasks:
-        if not is_done and rem_time == now_str:
+    
+    for t_id, user_id, title, is_daily, rem_time, is_done, created_at, last_completed_date, last_reminded_date in tasks:
+        if not rem_time:
+            continue
+            
+        # If task was already completed today, skip reminder
+        if is_done and last_completed_date == today_str:
+            continue
+            
+        # If already reminded today, do not spam
+        if last_reminded_date == today_str:
+            continue
+            
+        try:
+            r_hour, r_min = map(int, rem_time.strip().split(":"))
+            r_minutes = r_hour * 60 + r_min
+        except Exception:
+            continue
+            
+        # Grace window: send if exact minute OR within 5 minutes past scheduled time
+        # (guarantees delivery even if server/bot rebooted or lagged during the exact minute)
+        diff = now_minutes - r_minutes
+        if 0 <= diff <= 5:
             title_escaped = html.escape(title)
-            # Задачу ставим в САМЫЙ верх, чтобы в пуш-уведомлении телефона сразу читалось название!
             text = (
                 f"📌 <b>{title_escaped}</b>\n\n"
                 f"<blockquote>⏰ <b>Напоминание • {rem_time}</b>\n"
@@ -399,17 +448,23 @@ async def check_reminders():
                         [InlineKeyboardButton(text="✅ Отметить выполненным", callback_data=f"remtoggle_{t_id}_1")]
                     ])
                 )
+                await db.mark_task_reminded(t_id, today_str)
+                logging.info(f"Reminder sent for task {t_id} ('{title}') to {user_id}")
             except Exception as e:
                 logging.error(f"Failed to send reminder to {user_id}: {e}")
 
 async def reset_daily():
-    await db.reset_daily_tasks()
-    logging.info("Daily tasks reset.")
+    today_str = get_today_str()
+    await db.ensure_daily_reset(today_str)
+    logging.info(f"Daily tasks reset checked for date: {today_str}")
 
 async def main():
     await db.init_db()
+    today_str = get_today_str()
+    await db.ensure_daily_reset(today_str)
+    logging.info(f"Bot started. Timezone: {TIMEZONE_NAME} ({BOT_TZ}). Current time: {get_now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=BOT_TZ)
     scheduler.add_job(check_reminders, 'cron', minute='*')
     scheduler.add_job(reset_daily, 'cron', hour=0, minute=0)
     scheduler.start()
