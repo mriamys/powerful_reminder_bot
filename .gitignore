@@ -2,3 +2,12 @@ venv/
 __pycache__/
 *.db
 .env
+.env
+*.cache
+*.log
+*.session
+*.db-wal
+*.db-shm
+bot_state*.json
+__pycache__/
+*.pyc

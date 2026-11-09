@@ -1,0 +1,18 @@
+services:
+  powerful-reminder-bot:
+    build: .
+    container_name: powerful-reminder-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - .:/app
+    deploy:
+      resources:
+        reservations:
+          memory: 20M
+    networks:
+      - bots-net
+
+networks:
+  bots-net:
+    external: true
